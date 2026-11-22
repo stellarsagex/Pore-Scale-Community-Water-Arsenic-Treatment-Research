@@ -1,0 +1,109 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.size": 9,
+    "figure.dpi": 300,
+    "savefig.dpi": 600,
+})
+
+# Load DEM packing file (columns: x, y, z, r)
+data = np.loadtxt("Packed_DEM_FINAL.txt", comments="#")
+x, y, z, r = data.T
+
+# Scale coordinates to a 5 cm cube
+scale = 2.0
+x *= scale
+y *= scale
+z *= scale
+L = 0.05  # 5 cm in meters
+
+fig = plt.figure(figsize=(5, 5))
+ax = fig.add_subplot(111, projection="3d")
+
+xs = [0.0, L]
+ys = [0.0, L]
+zs = [0.0, L]
+
+# Cube edges
+edges = [
+    # bottom
+    ((xs[0], ys[0], zs[0]), (xs[1], ys[0], zs[0])),
+    ((xs[1], ys[0], zs[0]), (xs[1], ys[1], zs[0])),
+    ((xs[1], ys[1], zs[0]), (xs[0], ys[1], zs[0])),
+    ((xs[0], ys[1], zs[0]), (xs[0], ys[0], zs[0])),
+    # top
+    ((xs[0], ys[0], zs[1]), (xs[1], ys[0], zs[1])),
+    ((xs[1], ys[0], zs[1]), (xs[1], ys[1], zs[1])),
+    ((xs[1], ys[1], zs[1]), (xs[0], ys[1], zs[1])),
+    ((xs[0], ys[1], zs[1]), (xs[0], ys[0], zs[1])),
+    # verticals
+    ((xs[0], ys[0], zs[0]), (xs[0], ys[0], zs[1])),
+    ((xs[1], ys[0], zs[0]), (xs[1], ys[0], zs[1])),
+    ((xs[1], ys[1], zs[0]), (xs[1], ys[1], zs[1])),
+    ((xs[0], ys[1], zs[0]), (xs[0], ys[1], zs[1])),
+]
+for (x1, y1, z1), (x2, y2, z2) in edges:
+    ax.plot(
+        [x1, x2], [y1, y2], [z1, z2],
+        color="black", linewidth=0.2, zorder=1
+    )
+
+# Scatter plot of spheres
+ms = (r / r.max())**2 * 120.0
+ax.scatter(
+    x, y, z,
+    s=ms,
+    c="0.65",
+    edgecolors="0.35",
+    linewidths=0.2,
+    alpha=0.95,
+    zorder=2,
+)
+
+# Frame on x = 0 plane
+ax.plot(
+    [xs[0], xs[0], xs[0], xs[0], xs[0]],
+    [ys[0], ys[1], ys[1], ys[0], ys[0]],
+    [zs[0], zs[0], zs[1], zs[1], zs[0]],
+    color="black", linewidth=0.2, zorder=3
+)
+
+# Frame on y = 0 plane
+ax.plot(
+    [xs[0], xs[0], xs[0], xs[0], xs[0]],
+    [ys[0], ys[0], ys[0], ys[0], ys[0]],
+    [zs[0], zs[0], zs[1], zs[1], zs[0]],
+    color="black", linewidth=0.2, zorder=3
+)
+
+# Frame on top face z = L
+ax.plot(
+    [xs[0], xs[1], xs[1], xs[0], xs[0]],
+    [ys[0], ys[0], ys[1], ys[1], ys[0]],
+    [zs[1], zs[1], zs[1], zs[1], zs[1]],
+    color="black", linewidth=0.2, zorder=3
+)
+
+# Axes limits and labels
+ax.set_xlim(0.0, L)
+ax.set_ylim(0.0, L)
+ax.set_zlim(0.0, L)
+ax.set_box_aspect([L, L, L])
+
+ticks = np.linspace(0.0, L, 6)
+ax.set_xticks(ticks)
+ax.set_yticks(ticks)
+ax.set_zticks(ticks)
+
+ax.set_xlabel(r"$x$ [m]")
+ax.set_ylabel(r"$y$ [m]")
+ax.set_zlabel(r"$z$ [m]")
+ax.set_title("Sphere packing")
+
+ax.view_init(elev=20, azim=135)
+plt.tight_layout()
+plt.savefig("Sand_Packing_3D.png", bbox_inches="tight")
+plt.show()

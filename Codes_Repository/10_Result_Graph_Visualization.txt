@@ -1,0 +1,147 @@
+#!/usr/bin/env python3
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+plt.style.use("seaborn-v0_8-whitegrid")
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.size": 8,          # smaller base font
+    "axes.labelsize": 9,
+    "axes.titlesize": 10,
+    "legend.fontsize": 6,    # smaller legend
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "lines.linewidth": 1.0,  # thinner default lines
+    "figure.dpi": 300,
+    "savefig.dpi": 600,
+})
+
+file_q    = "EXCEL_RESULT_Q_GLOBAL_50.xlsx"
+file_dqdt = "EXCEL_RESULT_DQDT_50.xlsx"
+file_Da   = "EXCEL_RESULT_Da_GLOBAL_50.xlsx"
+
+df_q    = pd.read_excel(file_q, sheet_name="Sheet1")
+df_dqdt = pd.read_excel(file_dqdt, sheet_name="Sheet1")
+df_Da   = pd.read_excel(file_Da, sheet_name="Sheet1")
+
+n_q = min(9, len(df_q), len(df_dqdt))
+
+U_col   = df_q.columns[0]
+Cin_col = df_q.columns[1]
+pH_col  = df_q.columns[2]
+
+q_cols = sorted(df_q.columns[3:], key=lambda x: float(x))
+t_hours = np.arange(1, len(q_cols) + 1, dtype=float)
+
+base_cmap = plt.cm.viridis
+
+# ---------------- q_global(t): 9 curves ----------------
+fig_q, ax_q = plt.subplots(figsize=(6.0, 4.2))
+colors_q = base_cmap(np.linspace(0, 1, n_q))
+
+markers_9_1 = [
+    'o', 's', '^', 'D', 'v', '<', '>', 'p', '*'
+]
+
+for idx in range(n_q):
+    row = df_q.iloc[idx]
+    U_str = str(row[U_col])
+    Cin   = float(row[Cin_col])
+    pH    = float(row[pH_col])
+    q_vals = row[q_cols].to_numpy(dtype=float)
+
+    label = f"U={U_str}, C_in={Cin:.0f} µg/L, pH={pH:.1f}"
+    ax_q.plot(t_hours, q_vals, color=colors_q[idx],
+              marker=markers_9_1[idx], ms=0.75, linewidth=0.5, label=label)
+
+ax_q.set_xlabel("Time [hours]")
+ax_q.set_ylabel(r"$q_{\mathrm{global}}(t)$ [mg g$^{-1}$]")
+ax_q.set_title(r"$q_{\mathrm{global}}(t)$ vs. Time [hours] (9 Aggregated Cases of U) (U in m/s)")
+ax_q.grid(True, alpha=0.3)
+ax_q.legend(ncol=1, frameon=True, framealpha=0.9,
+            fontsize=6, loc="best")
+fig_q.tight_layout()
+fig_q.savefig("q_global_9_cases_Final.png")
+plt.close(fig_q)
+
+# ---------------- dq/dt(t): 9 curves ----------------
+fig_dqdt, ax_dqdt = plt.subplots(figsize=(6.0, 4.2))
+markers_9_2 = [
+    'o', 's', '^', 'D', 'v', '<', '>', 'p', '*'
+]
+for idx in range(n_q):
+    row = df_dqdt.iloc[idx]
+    U_str = str(df_q.iloc[idx][U_col])
+    Cin   = float(df_q.iloc[idx][Cin_col])
+    pH    = float(df_q.iloc[idx][pH_col])
+    dqdt_vals = row[q_cols].to_numpy(dtype=float)
+
+    label = f"U={U_str}, C_in={Cin:.0f} µg/L, pH={pH:.1f}"
+    ax_dqdt.plot(t_hours, dqdt_vals, color=colors_q[idx],
+                 marker=markers_9_2[idx], ms=0.75, linewidth=0.5, label=label)
+
+ax_dqdt.set_xlabel("Time [hours]")
+ax_dqdt.set_ylabel(r"$\mathrm{d}q/\mathrm{d}t$ [mg g$^{-1}$ h$^{-1}$]")
+ax_dqdt.set_title(r"$\mathrm{d}q/\mathrm{d}t$ vs. Time [hours] (9 Aggregated Cases of U) (U in m/s)")
+ax_dqdt.grid(True, alpha=0.3)
+ax_dqdt.axhline(0.0, color="k", linewidth=0.5, linestyle="--", alpha=0.5)
+ax_dqdt.legend(ncol=1, frameon=True, framealpha=0.9,
+               fontsize=6, loc="best")
+fig_dqdt.tight_layout()
+fig_dqdt.savefig("dqdt_9_cases_Final.png")
+plt.close(fig_dqdt)
+
+# ---------------- Da(t): 27 curves with richer colours ----------------
+fig_Da, ax_Da = plt.subplots(figsize=(6.0, 4.2))
+
+n_Da = len(df_Da)
+
+# Use several distinct colormaps, each providing a gradient
+cmaps = [
+    plt.cm.viridis,
+    plt.cm.plasma,
+    plt.cm.inferno,
+    plt.cm.magma,
+    plt.cm.cividis,
+    plt.cm.tab10,
+]
+
+colors_Da = []
+n_per_cmap = int(np.ceil(n_Da / len(cmaps)))
+for cm in cmaps:
+    grad = cm(np.linspace(0.1, 0.9, n_per_cmap))  # internal range to avoid extremes
+    colors_Da.extend(list(grad))
+colors_Da = colors_Da[:n_Da]  # trim to exactly n_Da colours
+
+markers_27 = [
+    'o', 's', '^', 'D', 'v', '<', '>', 'p', '*', 'h', 'H', '+', 'x', 'd', 
+    '1', '2', '3', '4', '8', 's', 'p', '|', '_', 
+    '$\\alpha$', '$\\beta$', '$\\gamma$', '$\\delta$', '$\\nabla$'
+]
+
+for idx in range(n_Da):
+    row = df_Da.iloc[idx]
+    U_str = str(row[U_col])
+    Cin   = float(row[Cin_col])
+    pH    = float(row[pH_col])
+    Da_vals = row[q_cols].to_numpy(dtype=float)
+
+    label = f"U={U_str}, C_in={Cin:.0f}, pH={pH:.1f}"
+    ax_Da.plot(t_hours, Da_vals,
+               color=colors_Da[idx],
+               marker=markers_27[idx], ms=0.75, linewidth=0.3,
+               label=label)
+
+ax_Da.set_xlabel("Time [hours]")
+ax_Da.set_ylabel(r"$Da(t)$")
+ax_Da.set_title(r"$Da(t)$ vs. Time [hours] (27 Combinations) (U in m/s, C_in in μg/L)")
+ax_Da.grid(True, alpha=0.3)
+ax_Da.set_yscale("log")
+ax_Da.legend(ncol=2, frameon=True, framealpha=0.9,
+             fontsize=5, loc="best")
+fig_Da.tight_layout()
+fig_Da.savefig("Da_27_cases_Final.png")
+plt.close(fig_Da)
+
+print("Saved q_global_9_cases_Final.png, dqdt_9_cases_Final.png, Da_27_cases_Final.png")

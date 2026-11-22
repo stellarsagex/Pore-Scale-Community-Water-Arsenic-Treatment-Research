@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+"""
+Curve fitting and end-of-adsorption time for q_global(t) from EXCEL_RESULT_Q_GLOBAL_50.xlsx.
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.optimize import curve_fit
+import os
+
+# Plot style
+plt.style.use("seaborn-v0_8-whitegrid")
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.size": 11,
+    "axes.labelsize": 12,
+    "axes.titlesize": 11,
+    "legend.fontsize": 9,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "figure.dpi": 300,
+    "savefig.dpi": 300,
+    "lines.linewidth": 1.5,
+})
+
+os.makedirs("q_global_plots", exist_ok=True)
+
+# Load q_global data
+df = pd.read_excel("EXCEL_RESULT_Q_GLOBAL_50.xlsx", sheet_name="Sheet1")
+
+U_col   = df.columns[0]
+Cin_col = df.columns[1]
+pH_col  = df.columns[2]
+
+q_cols = list(df.columns[3:])
+q_cols = sorted(q_cols, key=lambda x: float(x))
+
+nsteps = len(q_cols)
+hours_per_step = 1.0
+t_raw = np.arange(1, nsteps + 1) * hours_per_step
+
+# Model and helper functions
+def q_model(t, q_inf, tau):
+    """Exponential saturation model q(t) = q_inf * (1 - exp(-t/tau))."""
+    return q_inf * (1.0 - np.exp(-t / tau))
+
+def fit_q_curve(t, q_raw):
+    """Fit q_model to one curve."""
+    mask = q_raw > 0.0
+    if np.sum(mask) < 5:
+        return np.nan, np.nan
+    t_fit = t[mask]
+    q_fit = q_raw[mask]
+    q_inf_guess = q_fit[-1]
+    tau_guess = max((t_fit[-1] - t_fit[0]) / 2.0, 1.0)
+    try:
+        popt, _ = curve_fit(
+            q_model, t_fit, q_fit,
+            p0=[q_inf_guess, tau_guess],
+            bounds=([0.0, 1e-6], [10.0 * max(q_fit), 1e6]),
+            maxfev=10000,
+        )
+        return float(popt[0]), float(popt[1])
+    except Exception:
+        return np.nan, np.nan
+
+def compute_end_time_relative(
+    q_inf,
+    tau_q,
+    frac_slope=1e-2,
+    frac_curv=1e-2,
+    t_max_hours=365.0 * 24.0,
+):
+    """
+    End time where |dq/dt| and |d2q/dt2| fall below given fractions of their maxima
+    and remain below.
+    """
+    if not (np.isfinite(q_inf) and np.isfinite(tau_q)) or tau_q <= 0.0:
+        return np.nan
+
+    t_ext = np.linspace(0.0, t_max_hours, int(t_max_hours) + 1)
+    q_ext = q_model(t_ext, q_inf, tau_q)
+    dt = t_ext[1] - t_ext[0]
+
+    dq_dt = np.gradient(q_ext, dt)
+    d2q_dt2 = np.gradient(dq_dt, dt)
+
+    max_slope = np.max(np.abs(dq_dt))
+    max_curv  = np.max(np.abs(d2q_dt2))
+    if max_slope == 0 or max_curv == 0:
+        return np.nan
+
+    slope_tol = frac_slope * max_slope
+    curv_tol  = frac_curv * max_curv
+
+    end_index = None
+    for i in range(len(t_ext)):
+        if abs(dq_dt[i]) < slope_tol and abs(d2q_dt2[i]) < curv_tol:
+            if (np.all(np.abs(dq_dt[i:]) < slope_tol) and
+                np.all(np.abs(d2q_dt2[i:]) < curv_tol)):
+                end_index = i
+                break
+
+    if end_index is None:
+        return np.nan
+    return float(t_ext[end_index])
+
+FRAC_SLOPE = 1e-2
+FRAC_CURV  = 1e-2
+
+# Loop over rows and fit curves
+rows_out = []
+
+for idx, row in df.iterrows():
+    U_str = str(row[U_col])
+    Cin   = float(row[Cin_col])
+    pH    = float(row[pH_col])
+    q_raw = row[q_cols].to_numpy(dtype=float)
+
+    q_inf, tau_q = fit_q_curve(t_raw, q_raw)
+    t_end = compute_end_time_relative(
+        q_inf,
+        tau_q,
+        frac_slope=FRAC_SLOPE,
+        frac_curv=FRAC_CURV,
+    )
+
+    rows_out.append({
+        "U_list": U_str,
+        "C_in_ugL": Cin,
+        "pH": pH,
+        "q_inf_mg_per_g": q_inf,
+        "tau_hours": tau_q,
+        "t_end_hours": t_end,
+        "t_end_days": t_end / 24.0 if np.isfinite(t_end) else np.nan,
+    })
+
+    if np.isfinite(t_end):
+        t_max_plot = min(t_end * 1.5, 365.0 * 24.0)
+    else:
+        t_max_plot = 365.0 * 24.0
+
+    t_ext_plot = np.linspace(0.0, t_max_plot, 1000)
+    q_ext_plot = (
+        q_model(t_ext_plot, q_inf, tau_q)
+        if np.isfinite(q_inf)
+        else np.full_like(t_ext_plot, np.nan)
+    )
+
+    fig, ax = plt.subplots(figsize=(4.8, 3.6))
+
+    ax.scatter(t_raw, q_raw, color="black", s=0.5, label="Simulation (50 steps)")
+    ax.plot(t_ext_plot, q_ext_plot, color="C0", linewidth=0.5,
+            label="Fitted q$_{global}$(t)")
+
+    if np.isfinite(t_end):
+        q_end = q_model(t_end, q_inf, tau_q)
+        ax.axvline(t_end, color="C3", linestyle="--", linewidth=0.4)
+        ax.scatter([t_end], [q_end], color="C3", s=1, zorder=5)
+        ax.text(
+            t_end,
+            q_end,
+            f"  |dq/dt|<{FRAC_SLOPE:.0e}·max\n"
+            f"  |d²q/dt²|<{FRAC_CURV:.0e}·max\n"
+            f"  t ≈ {t_end/24:.1f} d",
+            va="center",
+            ha="left",
+            fontsize=8.5,
+            color="C3",
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="none", alpha=0.8),
+        )
+
+    ax.set_xlabel("Time [hours]", fontsize=9)
+    ax.set_ylabel("Global adsorbed mass q$_{global}$ [mg g$^{-1}$]", fontsize=9)
+
+    title_main = "q$_{global}$(t) and end-of-adsorption"
+    title_sub  = f"U = {U_str} m/s, C$_{{in}}$ = {Cin:.0f} µg/L, pH = {pH:.1f}"
+    ax.set_title(title_main + "\n" + title_sub, fontsize=9)
+
+    ax.legend(
+        frameon=True,
+        loc="lower right",
+        framealpha=0.9,
+        facecolor="white",
+        edgecolor="gray",
+    )
+
+    fig.tight_layout()
+    fname = f"q_global_plots/q_global_end_Cin{Cin:.0f}_pH{pH:.1f}.png"
+    fname = fname.replace("+", "").replace("-", "m")
+    fig.savefig(fname, dpi=300)
+    plt.close(fig)
+
+# Save summary table
+summary_df = pd.DataFrame(rows_out)
+summary_df.to_csv("Q_GLOBAL_CURVE_FIT.csv", index=False)
+print("Saved summary to Q_GLOBAL_CURVE_FIT.csv")
+print("Saved figures to folder q_global_plots/")

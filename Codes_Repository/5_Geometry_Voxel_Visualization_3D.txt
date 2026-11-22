@@ -1,0 +1,124 @@
+import numpy as np
+import matplotlib.pyplot as plt
+from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.size": 9,
+    "axes.labelsize": 10,
+    "axes.titlesize": 11,
+    "xtick.labelsize": 8,
+    "ytick.labelsize": 8,
+    "figure.dpi": 300,
+    "savefig.dpi": 600,
+})
+
+# Load solid mask and velocity magnitude snapshot
+solid = np.load("solid_mask.npy")              # shape (nx, ny, nz)
+u_mag = np.load("u_mag_snapshot_step800.npy")  # shape (nx, ny, nz)
+
+nx, ny, nz = solid.shape
+ix, iy, iz = np.indices((nx, ny, nz))
+
+# Pore voxels and corresponding velocities
+pore_mask = (solid == 0)
+ix_p = ix[pore_mask]
+iy_p = iy[pore_mask]
+iz_p = iz[pore_mask]
+u_vals = u_mag[pore_mask]
+
+# Downsample pore voxels for plotting
+step_p = 2
+ix_p   = ix_p[::step_p]
+iy_p   = iy_p[::step_p]
+iz_p   = iz_p[::step_p]
+u_vals = u_vals[::step_p]
+
+fig = plt.figure(figsize=(7.0, 5.5))
+ax = fig.add_subplot(111, projection="3d")
+
+xs = [0, nx - 1]
+ys = [0, ny - 1]
+zs = [0, nz - 1]
+
+# Cube edges
+edges = [
+    # bottom
+    ((xs[0], ys[0], zs[0]), (xs[1], ys[0], zs[0])),
+    ((xs[1], ys[0], zs[0]), (xs[1], ys[1], zs[0])),
+    ((xs[1], ys[1], zs[0]), (xs[0], ys[1], zs[0])),
+    ((xs[0], ys[1], zs[0]), (xs[0], ys[0], zs[0])),
+    # top
+    ((xs[0], ys[0], zs[1]), (xs[1], ys[0], zs[1])),
+    ((xs[1], ys[0], zs[1]), (xs[1], ys[1], zs[1])),
+    ((xs[1], ys[1], zs[1]), (xs[0], ys[1], zs[1])),
+    ((xs[0], ys[1], zs[1]), (xs[0], ys[0], zs[1])),
+    # verticals
+    ((xs[0], ys[0], zs[0]), (xs[0], ys[0], zs[1])),
+    ((xs[1], ys[0], zs[0]), (xs[1], ys[0], zs[1])),
+    ((xs[1], ys[1], zs[0]), (xs[1], ys[1], zs[1])),
+    ((xs[0], ys[1], zs[0]), (xs[0], ys[1], zs[1])),
+]
+
+for (x1, y1, z1), (x2, y2, z2) in edges:
+    ax.plot(
+        [x1, x2], [y1, y2], [z1, z2],
+        color="black", linewidth=0.5, zorder=1
+    )
+
+# Scatter plot of pore-scale velocity magnitude
+p = ax.scatter(
+    ix_p, iy_p, iz_p,
+    c=u_vals,
+    cmap="viridis",
+    s=6,
+    marker="o",
+    edgecolors="none",
+    zorder=2,
+)
+
+cbar = fig.colorbar(p, ax=ax, pad=0.03)
+cbar.set_label(r"Velocity magnitude $|u|$ (lattice units)")
+
+# Frames on selected faces
+ax.plot(
+    [xs[0], xs[0], xs[0], xs[0], xs[0]],
+    [ys[0], ys[1], ys[1], ys[0], ys[0]],
+    [zs[0], zs[0], zs[1], zs[1], zs[0]],
+    color="black", linewidth=0.5, zorder=3
+)
+
+ax.plot(
+    [xs[0], xs[0], xs[0], xs[0], xs[0]],
+    [ys[0], ys[0], ys[0], ys[0], ys[0]],
+    [zs[0], zs[0], zs[1], zs[1], zs[0]],
+    color="black", linewidth=0.5, zorder=3
+)
+
+ax.plot(
+    [xs[0], xs[1], xs[1], xs[0], xs[0]],
+    [ys[0], ys[0], ys[1], ys[1], ys[0]],
+    [zs[1], zs[1], zs[1], zs[1], zs[1]],
+    color="black", linewidth=0.5, zorder=3
+)
+
+ax.set_xlabel("x index")
+ax.set_ylabel("y index")
+ax.set_zlabel("z index")
+ax.set_title("Pore-scale velocity in 64³ domain")
+
+ax.set_xlim(-0.5, nx - 0.5)
+ax.set_ylim(-0.5, ny - 0.5)
+ax.set_zlim(-0.5, nz - 0.5)
+
+ticks = np.arange(0, nx + 1, 8)
+ax.set_xticks(ticks)
+ax.set_yticks(ticks)
+ax.set_zticks(ticks)
+
+ax.set_box_aspect([nx, ny, nz])
+
+ax.view_init(elev=25, azim=135)
+plt.tight_layout()
+plt.savefig("u_3D_64_Cube_Final.png")
+plt.show()

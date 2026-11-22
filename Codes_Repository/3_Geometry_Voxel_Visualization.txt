@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""
+3D D3Q19 lattice Boltzmann flow on a voxelised sphere packing.
+
+- Reads DEM spheres from Packed_DEM_FINAL.txt (x y z r in meters; '#' as comment)
+- Builds a 64×64×64 voxel sub-domain
+- Runs D3Q19 BGK flow with a velocity inlet at x = 0, periodic y, z, bounce-back on solids
+- Saves:
+    solid_mask.npy
+    u_mag_snapshot_stepXXXX.npy  (3D velocity magnitude at an intermediate step)
+    u_mag_final.npy              (3D velocity magnitude at final step)
+"""
+
+import numpy as np
+
+# ------------------------------------------------------------
+# DEM loading and voxelisation
+# ------------------------------------------------------------
+
+def load_dem_particles(dem_path):
+    data = []
+    with open(dem_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 4:
+                continue
+            x, y, z, r = map(float, parts[:4])
+            data.append((x, y, z, r))
+    data = np.array(data, dtype=np.float64)
+    if data.size == 0:
+        raise RuntimeError("DEM file has no valid particle lines.")
+    return data  # (N, 4)
+
+
+def build_voxel_geometry_from_dem_subdomain(
+    dem_path,
+    nx=64,
+    ny=64,
+    nz=64,
+    voxels_per_min_d=10,
+):
+    dem = load_dem_particles(dem_path)
+    x = dem[:, 0]
+    y = dem[:, 1]
+    z = dem[:, 2]
+    r = dem[:, 3]
+
+    r_min = r.min()
+    d_min = 2.0 * r_min
+    dx = d_min / float(voxels_per_min_d)
+
+    xmin_all, xmax_all = x.min(), x.max()
+    ymin_all, ymax_all = y.min(), y.max()
+    zmin_all, zmax_all = z.min(), z.max()
+
+    xmid = 0.5 * (xmin_all + xmax_all)
+    ymid = 0.5 * (ymin_all + ymax_all)
+    zmid = 0.5 * (zmin_all + zmax_all)
+
+    Lx = nx * dx
+    Ly = ny * dx
+    Lz = nz * dx
+
+    xmin = xmid - 0.5 * Lx
+    xmax = xmid + 0.5 * Lx
+    ymin = ymid - 0.5 * Ly
+    ymax = ymid + 0.5 * Ly
+    zmin = zmid - 0.5 * Lz
+    zmax = zmid + 0.5 * Lz
+
+    xmin = max(xmin, xmin_all)
+    xmax = min(xmax, xmax_all)
+    ymin = max(ymin, ymin_all)
+    ymax = min(ymax, ymax_all)
+    zmin = max(zmin, zmin_all)
+    zmax = min(zmax, zmax_all)
+
+    xv = xmin + (np.arange(nx) + 0.5) * dx
+    yv = ymin + (np.arange(ny) + 0.5) * dx
+    zv = zmin + (np.arange(nz) + 0.5) * dx
+
+    solid = np.zeros((nx, ny, nz), dtype=np.uint8)
+
+    mask_box = (
+        (x + r >= xmin) & (x - r <= xmax) &
+        (y + r >= ymin) & (y - r <= ymax) &
+        (z + r >= zmin) & (z - r <= zmax)
+    )
+    dem_sub = dem[mask_box, :]
+    if dem_sub.size == 0:
+        raise RuntimeError("No DEM spheres intersect the chosen sub-domain.")
+
+    for px, py, pz, pr in dem_sub:
+        ix_min = max(0, int(np.floor((px - pr - xmin) / dx)))
+        ix_max = min(nx - 1, int(np.floor((px + pr - xmin) / dx)))
+        iy_min = max(0, int(np.floor((py - pr - ymin) / dx)))
+        iy_max = min(ny - 1, int(np.floor((py + pr - ymin) / dx)))
+        iz_min = max(0, int(np.floor((pz - pr - zmin) / dx)))
+        iz_max = min(nz - 1, int(np.floor((pz + pr - zmin) / dx)))
+
+        if ix_max < ix_min or iy_max < iy_min or iz_max < iz_min:
+            continue
+
+        xs = xv[ix_min:ix_max + 1]
+        ys = yv[iy_min:iy_max + 1]
+        zs = zv[iz_min:iz_max + 1]
+
+        X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+        dist2 = (X - px) ** 2 + (Y - py) ** 2 + (Z - pz) ** 2
+        mask_local = dist2 <= pr ** 2
+
+        solid[ix_min:ix_max + 1, iy_min:iy_max + 1, iz_min:iz_max + 1][mask_local] = 1
+
+    return solid, dx, nx, ny, nz
+
+# ------------------------------------------------------------
+# D3Q19 LBM
+# ------------------------------------------------------------
+
+def init_D3Q19():
+    c = np.array([
+        [ 0,  0,  0],
+        [ 1,  0,  0], [-1,  0,  0],
+        [ 0,  1,  0], [ 0, -1,  0],
+        [ 0,  0,  1], [ 0,  0, -1],
+        [ 1,  1,  0], [-1, -1,  0],
+        [ 1, -1,  0], [-1,  1,  0],
+        [ 1,  0,  1], [-1,  0, -1],
+        [ 1,  0, -1], [-1,  0,  1],
+        [ 0,  1,  1], [ 0, -1, -1],
+        [ 0,  1, -1], [ 0, -1,  1],
+    ], dtype=np.int32)
+
+    w = np.zeros(19, dtype=np.float64)
+    w[0] = 1.0 / 3.0
+    w[1:7] = 1.0 / 18.0
+    w[7:19] = 1.0 / 36.0
+
+    opp = np.array([
+        0,
+        2, 1,
+        4, 3,
+        6, 5,
+        8, 7,
+        10, 9,
+        12, 11,
+        14, 13,
+        18, 17, 16, 15,
+    ], dtype=np.int32)
+
+    return c, w, opp
+
+
+def lbm_flow_with_snapshot(
+    solid,
+    nx,
+    ny,
+    nz,
+    nsteps,
+    tau_f,
+    u_inlet,
+    snapshot_step,
+    u_clip=0.1,
+):
+    """
+    D3Q19 BGK flow with prescribed velocity at x = 0.
+
+    Returns:
+        u_final: 4D array (nx, ny, nz, 3) velocity at final step
+        u_snapshot: 4D array at 'snapshot_step'
+    """
+    c, w, opp = init_D3Q19()
+    cs2 = 1.0 / 3.0
+
+    f = np.zeros((nx, ny, nz, 19), dtype=np.float64)
+    rho = np.ones((nx, ny, nz), dtype=np.float64)
+    u = np.zeros((nx, ny, nz, 3), dtype=np.float64)
+
+    # Initialize at rest
+    for ix in range(nx):
+        for iy in range(ny):
+            for iz in range(nz):
+                rho0 = 1.0
+                u[ix, iy, iz, :] = (0.0, 0.0, 0.0)
+                usq = 0.0
+                for i in range(19):
+                    cu = 0.0
+                    f[ix, iy, iz, i] = w[i] * rho0 * (
+                        1.0 + cu / cs2 + 0.5 * (cu * cu / cs2 ** 2 - usq / cs2)
+                    )
+
+    u_snapshot = None
+
+    for step in range(1, nsteps + 1):
+        # Collision
+        feq = np.zeros_like(f)
+        for ix in range(nx):
+            for iy in range(ny):
+                for iz in range(nz):
+                    if solid[ix, iy, iz] == 1:
+                        continue
+                    ux, uy, uz = u[ix, iy, iz, :]
+                    ux = np.clip(ux, -u_clip, u_clip)
+                    uy = np.clip(uy, -u_clip, u_clip)
+                    uz = np.clip(uz, -u_clip, u_clip)
+                    u[ix, iy, iz, :] = (ux, uy, uz)
+                    rholoc = rho[ix, iy, iz]
+                    if (not np.isfinite(rholoc)) or (rholoc <= 0.0):
+                        rholoc = 1.0
+                        rho[ix, iy, iz] = rholoc
+                    usq = ux * ux + uy * uy + uz * uz
+                    for i in range(19):
+                        cu = c[i, 0] * ux + c[i, 1] * uy + c[i, 2] * uz
+                        feq[ix, iy, iz, i] = w[i] * rholoc * (
+                            1.0 + cu / cs2 + 0.5 * (cu * cu / cs2 ** 2 - usq / cs2)
+                        )
+                    f[ix, iy, iz, :] -= (f[ix, iy, iz, :] - feq[ix, iy, iz, :]) / tau_f
+
+        # Streaming
+        f_stream = np.zeros_like(f)
+        for i in range(19):
+            cx, cy, cz = c[i]
+            for ix in range(nx):
+                jx = ix + cx
+                if jx < 0:
+                    jx = 0
+                if jx >= nx:
+                    jx = nx - 1
+                for iy in range(ny):
+                    jy = iy + cy
+                    if jy < 0:
+                        jy += ny
+                    if jy >= ny:
+                        jy -= ny
+                    for iz in range(nz):
+                        jz = iz + cz
+                        if jz < 0:
+                            jz += nz
+                        if jz >= nz:
+                            jz -= nz
+                        f_stream[jx, jy, jz, i] = f[ix, iy, iz, i]
+        f = f_stream
+
+        # Bounce-back on solid nodes
+        for ix in range(nx):
+            for iy in range(ny):
+                for iz in range(nz):
+                    if solid[ix, iy, iz] == 1:
+                        for i in range(19):
+                            j = opp[i]
+                            tmp = f[ix, iy, iz, i]
+                            f[ix, iy, iz, i] = f[ix, iy, iz, j]
+                            f[ix, iy, iz, j] = tmp
+
+        # Velocity inlet at x = 0
+        ix = 0
+        uxin = np.clip(u_inlet, -u_clip, u_clip)
+        for iy in range(ny):
+            for iz in range(nz):
+                if solid[ix, iy, iz] == 1:
+                    continue
+                rholoc = 1.0
+                ux = uxin
+                uy = 0.0
+                uz = 0.0
+                usq = ux * ux + uy * uy + uz * uz
+                for i in range(19):
+                    cu = c[i, 0] * ux + c[i, 1] * uy + c[i, 2] * uz
+                    f[ix, iy, iz, i] = w[i] * rholoc * (
+                        1.0 + cu / cs2 + 0.5 * (cu * cu / cs2 ** 2 - usq / cs2)
+                    )
+
+        # Macroscopic fields
+        for ix in range(nx):
+            for iy in range(ny):
+                for iz in range(nz):
+                    rholoc = np.sum(f[ix, iy, iz, :])
+                    if (not np.isfinite(rholoc)) or (rholoc <= 0.0):
+                        rholoc = 1.0
+                    rho[ix, iy, iz] = rholoc
+                    if solid[ix, iy, iz] == 0:
+                        ux = np.dot(f[ix, iy, iz, :], c[:, 0]) / rholoc
+                        uy = np.dot(f[ix, iy, iz, :], c[:, 1]) / rholoc
+                        uz = np.dot(f[ix, iy, iz, :], c[:, 2]) / rholoc
+                        ux = np.clip(ux, -u_clip, u_clip)
+                        uy = np.clip(uy, -u_clip, u_clip)
+                        uz = np.clip(uz, -u_clip, u_clip)
+                        u[ix, iy, iz, :] = (ux, uy, uz)
+                    else:
+                        u[ix, iy, iz, :] = (0.0, 0.0, 0.0)
+
+        if step == snapshot_step:
+            u_snapshot = u.copy()
+
+    return u, u_snapshot
+
+# ------------------------------------------------------------
+# Main
+# ------------------------------------------------------------
+
+def main():
+    dem_path = "Packed_DEM_FINAL.txt"
+
+    nx, ny, nz = 64, 64, 64
+    voxels_per_min_d = 10
+
+    solid, dx, nx, ny, nz = build_voxel_geometry_from_dem_subdomain(
+        dem_path, nx=nx, ny=ny, nz=nz, voxels_per_min_d=voxels_per_min_d
+    )
+
+    print(f"Voxelised geometry: nx={nx}, ny={ny}, nz={nz}, dx={dx:.3e} m")
+    porosity = 1.0 - np.mean(solid)
+    print(f"Estimated porosity: {porosity:.3f}")
+
+    tau_f = 3.0
+    u_inlet = 0.02
+    nsteps = 2000
+    snapshot_step = 800
+
+    print(f"Running LBM flow: nsteps={nsteps}, "
+          f"snapshot_step={snapshot_step}, u_inlet={u_inlet:.3f}")
+
+    u_final, u_snap = lbm_flow_with_snapshot(
+        solid=solid,
+        nx=nx,
+        ny=ny,
+        nz=nz,
+        nsteps=nsteps,
+        tau_f=tau_f,
+        u_inlet=u_inlet,
+        snapshot_step=snapshot_step,
+        u_clip=0.1,
+    )
+
+    if u_snap is None:
+        raise RuntimeError("Snapshot was not captured; check snapshot_step vs nsteps.")
+
+    u_mag_final = np.linalg.norm(u_final, axis=-1)
+    u_mag_final[solid == 1] = 0.0
+
+    u_mag_snap = np.linalg.norm(u_snap, axis=-1)
+    u_mag_snap[solid == 1] = 0.0
+
+    np.save("solid_mask.npy", solid.astype(np.uint8))
+    np.save(f"u_mag_snapshot_step{snapshot_step}.npy", u_mag_snap)
+    np.save("u_mag_final.npy", u_mag_final)
+
+    pore_mask = (solid == 0)
+    print(f"Snapshot step {snapshot_step}: "
+          f"mean |u|={u_mag_snap[pore_mask].mean():.4e}, "
+          f"max |u|={u_mag_snap[pore_mask].max():.4e}")
+    print(f"Final step {nsteps}: "
+          f"mean |u|={u_mag_final[pore_mask].mean():.4e}, "
+          f"max |u|={u_mag_final[pore_mask].max():.4e}")
+    print("Saved: solid_mask.npy, u_mag_snapshot_stepXXXX.npy, u_mag_final.npy")
+
+
+if __name__ == "__main__":
+    main()

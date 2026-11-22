@@ -1,0 +1,36 @@
+import numpy as np
+import pandas as pd
+
+npz_file = "lbm_rt_reactive_summary_q_Da_fast.npz"
+excel_file = "EXCEL_RESULT.xlsx"
+
+data = np.load(npz_file)
+
+with pd.ExcelWriter(excel_file) as writer:
+    for key in data.files:
+        arr = data[key]
+
+        # Scalar → single-row DataFrame
+        if not hasattr(arr, "shape") or arr.shape == ():
+            df = pd.DataFrame({"value": [arr.item()]})
+            df.to_excel(writer, sheet_name=key[:31], index=False)
+            continue
+
+        # 1D array → single-column DataFrame
+        if arr.ndim == 1:
+            df = pd.DataFrame({key: arr})
+            df.to_excel(writer, sheet_name=key[:31], index=False)
+            continue
+
+        # 2D array → 2D table
+        if arr.ndim == 2:
+            df = pd.DataFrame(arr)
+            df.to_excel(writer, sheet_name=key[:31], index=False)
+            continue
+
+        # 3D or higher → flatten all but last axis into rows
+        flat = arr.reshape(-1, arr.shape[-1])
+        df = pd.DataFrame(flat)
+        df.to_excel(writer, sheet_name=key[:31], index=False)
+
+print("Wrote NPZ contents to:", excel_file)

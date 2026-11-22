@@ -1,0 +1,539 @@
+# -*- coding: utf-8 -*-
+"""
+3D reactive LBM–RT on a voxelised sphere packing with parameter sweeps.
+"""
+
+import numpy as np
+
+
+# -------------------------------------------------------
+# 1. Load DEM packing
+# -------------------------------------------------------
+
+def load_packing(fname):
+    """
+    Load a YADE packing text file with columns: x y z r.
+    """
+    data = np.loadtxt(fname, comments="#")
+    centers = data[:, 0:3]
+    radii = data[:, 3]
+    return centers, radii
+
+
+# -------------------------------------------------------
+# 2. Voxelisation
+# -------------------------------------------------------
+
+def voxelize_spheres_subdomain(centers, radii,
+                               nx=120, ny=100, nz=100,
+                               n_per_d_min=20):
+    """
+    Voxelise a central sub-domain of the packing into a solid mask.
+
+    dx = (min diameter)/n_per_d_min, sub-domain size = (nx, ny, nz) voxels.
+    """
+    centers = np.asarray(centers, dtype=np.float64)
+    radii = np.asarray(radii, dtype=np.float64)
+
+    r_min = radii.min()
+    d_min = 2.0 * r_min
+    dx = d_min / float(n_per_d_min)
+
+    cmin = centers.min(axis=0)
+    cmax = centers.max(axis=0)
+    c_mid = 0.5 * (cmin + cmax)
+
+    Lx = nx * dx
+    Ly = ny * dx
+    Lz = nz * dx
+
+    domain_min = c_mid - 0.5 * np.array([Lx, Ly, Lz])
+    domain_max = c_mid + 0.5 * np.array([Lx, Ly, Lz])
+
+    domain_min = np.maximum(domain_min, cmin)
+    domain_max = np.minimum(domain_max, cmax)
+
+    xv = domain_min[0] + (np.arange(nx) + 0.5) * dx
+    yv = domain_min[1] + (np.arange(ny) + 0.5) * dx
+    zv = domain_min[2] + (np.arange(nz) + 0.5) * dx
+
+    solid = np.zeros((nx, ny, nz), dtype=np.uint8)
+
+    x, y, z = centers[:, 0], centers[:, 1], centers[:, 2]
+    r = radii
+    mask = (
+        (x + r >= domain_min[0]) & (x - r <= domain_max[0]) &
+        (y + r >= domain_min[1]) & (y - r <= domain_max[1]) &
+        (z + r >= domain_min[2]) & (z - r <= domain_max[2])
+    )
+    centers_sub = centers[mask]
+    radii_sub = radii[mask]
+
+    for cx, cy, cz, rr in zip(centers_sub[:, 0], centers_sub[:, 1],
+                              centers_sub[:, 2], radii_sub):
+        ix_min = max(0, int(np.floor((cx - rr - domain_min[0]) / dx)))
+        ix_max = min(nx - 1, int(np.floor((cx + rr - domain_min[0]) / dx)))
+        iy_min = max(0, int(np.floor((cy - rr - domain_min[1]) / dx)))
+        iy_max = min(ny - 1, int(np.floor((cy + rr - domain_min[1]) / dx)))
+        iz_min = max(0, int(np.floor((cz - rr - domain_min[2]) / dx)))
+        iz_max = min(nz - 1, int(np.floor((cz + rr - domain_min[2]) / dx)))
+
+        xs = xv[ix_min:ix_max + 1]
+        ys = yv[iy_min:iy_max + 1]
+        zs = zv[iz_min:iz_max + 1]
+
+        X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
+        dist2 = (X - cx) ** 2 + (Y - cy) ** 2 + (Z - cz) ** 2
+        mask_local = dist2 <= rr ** 2
+        solid[ix_min:ix_max + 1, iy_min:iy_max + 1, iz_min:iz_max + 1][mask_local] = 1
+
+    return solid, domain_min, dx, nx, ny, nz
+
+
+# -------------------------------------------------------
+# 3. LBM utilities
+# -------------------------------------------------------
+
+def init_D3Q19():
+    c = np.array([
+        [0, 0, 0],
+        [1, 0, 0], [-1, 0, 0],
+        [0, 1, 0], [0, -1, 0],
+        [0, 0, 1], [0, 0, -1],
+        [1, 1, 0], [-1, -1, 0],
+        [1, -1, 0], [-1, 1, 0],
+        [1, 0, 1], [-1, 0, -1],
+        [1, 0, -1], [-1, 0, 1],
+        [0, 1, 1], [0, -1, -1],
+        [0, 1, -1], [0, -1, 1],
+    ], dtype=np.int32)
+
+    w = np.zeros(19, dtype=np.float64)
+    w[0] = 1.0 / 3.0
+    w[1:7] = 1.0 / 18.0
+    w[7:19] = 1.0 / 36.0
+
+    opp = np.array([
+        0, 2, 1,
+        4, 3, 6,
+        5, 8, 7,
+        10, 9, 12,
+        11, 14, 13,
+        18, 17, 16, 15,
+    ], dtype=np.int32)
+
+    return c, w, opp
+
+
+def init_D3Q7():
+    c = np.array([
+        [0, 0, 0],
+        [1, 0, 0], [-1, 0, 0],
+        [0, 1, 0], [0, -1, 0],
+        [0, 0, 1], [0, 0, -1],
+    ], dtype=np.int32)
+
+    w = np.array([
+        1.0 / 4.0,
+        1.0 / 8.0, 1.0 / 8.0,
+        1.0 / 8.0, 1.0 / 8.0,
+        1.0 / 8.0, 1.0 / 8.0,
+    ], dtype=np.float64)
+    return c, w
+
+
+# -------------------------------------------------------
+# 4. Flow LBM (D3Q19)
+# -------------------------------------------------------
+
+def lbm_flow(solid, nx, ny, nz, nsteps, tau_f, u_inlet, u_clip=0.1):
+    """
+    D3Q19 BGK flow with bounce-back on solids and velocity inlet at x = 0.
+    """
+    c, w, opp = init_D3Q19()
+    cs2 = 1.0 / 3.0
+
+    f = np.zeros((nx, ny, nz, 19), dtype=np.float64)
+    rho = np.ones((nx, ny, nz), dtype=np.float64)
+    u = np.zeros((nx, ny, nz, 3), dtype=np.float64)
+
+    for ix in range(nx):
+        for iy in range(ny):
+            for iz in range(nz):
+                rho0 = 1.0
+                u[ix, iy, iz, :] = (0.0, 0.0, 0.0)
+                for i in range(19):
+                    f[ix, iy, iz, i] = w[i] * rho0
+
+    for _ in range(nsteps):
+        feq = np.zeros_like(f)
+        for ix in range(nx):
+            for iy in range(ny):
+                for iz in range(nz):
+                    if solid[ix, iy, iz] == 1:
+                        continue
+                    ux, uy, uz = u[ix, iy, iz, :]
+                    ux = np.clip(ux, -u_clip, u_clip)
+                    uy = np.clip(uy, -u_clip, u_clip)
+                    uz = np.clip(uz, -u_clip, u_clip)
+                    u[ix, iy, iz, :] = (ux, uy, uz)
+
+                    rho_loc = rho[ix, iy, iz]
+                    if (not np.isfinite(rho_loc)) or (rho_loc <= 0.0):
+                        rho_loc = 1.0
+                        rho[ix, iy, iz] = rho_loc
+                    usq = ux * ux + uy * uy + uz * uz
+                    for i in range(19):
+                        cu = c[i, 0] * ux + c[i, 1] * uy + c[i, 2] * uz
+                        feq[ix, iy, iz, i] = w[i] * rho_loc * (
+                            1.0 + cu / cs2 + 0.5 * (cu * cu / cs2 ** 2 - usq / cs2)
+                        )
+        f -= (f - feq) / tau_f
+
+        f_stream = np.zeros_like(f)
+        for i in range(19):
+            cx, cy, cz = c[i]
+            for ix in range(nx):
+                jx = ix + cx
+                if jx < 0:
+                    jx = 0
+                if jx >= nx:
+                    jx = nx - 1
+                for iy in range(ny):
+                    jy = (iy + cy) % ny
+                    for iz in range(nz):
+                        jz = iz + cz
+                        if jz < 0:
+                            jz = nz - 1
+                        if jz >= nz:
+                            jz = 0
+                        f_stream[jx, jy, jz, i] = f[ix, iy, iz, i]
+        f = f_stream
+
+        for ix in range(nx):
+            for iy in range(ny):
+                for iz in range(nz):
+                    if solid[ix, iy, iz] == 1:
+                        for i in range(19):
+                            j = opp[i]
+                            tmp = f[ix, iy, iz, i]
+                            f[ix, iy, iz, i] = f[ix, iy, iz, j]
+                            f[ix, iy, iz, j] = tmp
+
+        ix = 0
+        ux_in = np.clip(u_inlet, -u_clip, u_clip)
+        for iy in range(ny):
+            for iz in range(nz):
+                if solid[ix, iy, iz] == 1:
+                    continue
+                rho_loc = 1.0
+                ux, uy, uz = ux_in, 0.0, 0.0
+                usq = ux * ux
+                for i in range(19):
+                    cu = c[i, 0] * ux
+                    f[ix, iy, iz, i] = w[i] * rho_loc * (
+                        1.0 + cu / cs2 + 0.5 * (cu * cu / cs2 ** 2 - usq / cs2)
+                    )
+
+        for ix in range(nx):
+            for iy in range(ny):
+                for iz in range(nz):
+                    rho_loc = np.sum(f[ix, iy, iz, :])
+                    if (not np.isfinite(rho_loc)) or (rho_loc <= 0.0):
+                        rho[ix, iy, iz] = 1.0
+                        u[ix, iy, iz, :] = 0.0
+                        continue
+                    rho[ix, iy, iz] = rho_loc
+                    if solid[ix, iy, iz] == 0:
+                        ux = np.dot(f[ix, iy, iz, :], c[:, 0]) / rho_loc
+                        uy = np.dot(f[ix, iy, iz, :], c[:, 1]) / rho_loc
+                        uz = np.dot(f[ix, iy, iz, :], c[:, 2]) / rho_loc
+                        ux = np.clip(ux, -u_clip, u_clip)
+                        uy = np.clip(uy, -u_clip, u_clip)
+                        uz = np.clip(uz, -u_clip, u_clip)
+                        u[ix, iy, iz, :] = (ux, uy, uz)
+                    else:
+                        u[ix, iy, iz, :] = 0.0
+
+    return u
+
+
+# -------------------------------------------------------
+# 5. Scalar LBM and adsorption
+# -------------------------------------------------------
+
+def get_qmax(pH, q_ref):
+    pH_ref = 7.0
+    alpha = 0.25
+    q = q_ref * np.exp(-alpha * (pH - pH_ref))
+    return max(20.0, min(60.0, q))
+
+
+def get_k(pH, C_in_ugL, k_ref):
+    C_in_mgL = C_in_ugL / 1000.0
+    beta = 0.15
+    gamma = -0.15
+    if C_in_mgL <= 0.0:
+        C_in_mgL = 0.001
+    k = k_ref * np.exp(-beta * (pH - 7.0)) * (C_in_mgL / 0.1) ** gamma
+    return max(0.05, min(1.0, k))
+
+
+def init_D3Q7_scalar():
+    return init_D3Q7()
+
+
+def lbm_scalar_reactive(
+    solid, u, nx, ny, nz, nsteps, tau_c,
+    C_inlet, dx, qmax_phys, k_phys, rho_media,
+):
+    """
+    D3Q7 scalar LBM with simple surface reaction, returning q(t) [mg/g].
+    """
+    c, w = init_D3Q7_scalar()
+    cs2 = 1.0 / 3.0
+
+    g = np.zeros((nx, ny, nz, 7), dtype=np.float64)
+    C = np.zeros((nx, ny, nz), dtype=np.float64)
+    q = np.zeros((nx, ny, nz), dtype=np.float64)
+
+    cell_volume = dx ** 3
+    porosity = 0.4
+    solid_fraction = 1.0 - porosity
+    mass_media_per_cell = rho_media * solid_fraction * cell_volume
+    qmax_mg_per_kg = qmax_phys * 1000.0
+    qmax_mass_per_cell_mg = qmax_mg_per_kg * mass_media_per_cell
+    k_m3_per_mg_per_step = k_phys * 1e-3 / 60.0
+
+    total_media_mass = mass_media_per_cell * np.sum(solid == 1)
+
+    q_hist = np.zeros(nsteps, dtype=np.float64)
+
+    for ix in range(nx):
+        for iy in range(ny):
+            for iz in range(nz):
+                C[ix, iy, iz] = 0.0
+                g[ix, iy, iz, :] = w * 0.0
+
+    for step in range(nsteps):
+        geq = np.zeros_like(g)
+        for ix in range(nx):
+            for iy in range(ny):
+                for iz in range(nz):
+                    if solid[ix, iy, iz] == 1:
+                        continue
+                    C_loc = C[ix, iy, iz]
+                    ux, uy, uz = u[ix, iy, iz, :]
+                    for i in range(7):
+                        cu = c[i, 0] * ux + c[i, 1] * uy + c[i, 2] * uz
+                        geq[ix, iy, iz, i] = w[i] * C_loc * (1.0 + cu / cs2)
+        g -= (g - geq) / tau_c
+
+        g_stream = np.zeros_like(g)
+        for i in range(7):
+            cx, cy, cz = c[i]
+            for ix in range(nx):
+                jx = ix + cx
+                if jx < 0:
+                    jx = 0
+                if jx >= nx:
+                    jx = nx - 1
+                for iy in range(ny):
+                    jy = (iy + cy) % ny
+                    for iz in range(nz):
+                        jz = iz + cz
+                        if jz < 0:
+                            jz = nz - 1
+                        if jz >= nz:
+                            jz = 0
+                        g_stream[jx, jy, jz, i] = g[ix, iy, iz, i]
+        g = g_stream
+
+        for ix in range(nx):
+            for iy in range(ny):
+                for iz in range(nz):
+                    if solid[ix, iy, iz] == 1:
+                        g[ix, iy, iz, :] = 0.0
+
+        ix = 0
+        for iy in range(ny):
+            for iz in range(nz):
+                if solid[ix, iy, iz] == 1:
+                    continue
+                C[ix, iy, iz] = C_inlet
+                g[ix, iy, iz, :] = w * C_inlet
+
+        ix_out = nx - 1
+        ix_in = nx - 2
+        for iy in range(ny):
+            for iz in range(nz):
+                if solid[ix_out, iy, iz] == 1:
+                    continue
+                C[ix_out, iy, iz] = C[ix_in, iy, iz]
+                g[ix_out, iy, iz, :] = g[ix_in, iy, iz, :]
+
+        for ix in range(nx):
+            for iy in range(ny):
+                for iz in range(nz):
+                    if solid[ix, iy, iz] == 1:
+                        C[ix, iy, iz] = 0.0
+                    else:
+                        C[ix, iy, iz] = np.sum(g[ix, iy, iz, :])
+
+        for ix in range(nx):
+            for iy in range(ny):
+                for iz in range(nz):
+                    if solid[ix, iy, iz] == 1:
+                        continue
+                    neighbor_is_solid = False
+                    if ix > 0 and solid[ix - 1, iy, iz] == 1:
+                        neighbor_is_solid = True
+                    if ix < nx - 1 and solid[ix + 1, iy, iz] == 1:
+                        neighbor_is_solid = True
+                    if iy > 0 and solid[ix, iy - 1, iz] == 1:
+                        neighbor_is_solid = True
+                    if iy < ny - 1 and solid[ix, iy + 1, iz] == 1:
+                        neighbor_is_solid = True
+                    if iz > 0 and solid[ix, iy, iz - 1] == 1:
+                        neighbor_is_solid = True
+                    if iz < nz - 1 and solid[ix, iy, iz + 1] == 1:
+                        neighbor_is_solid = True
+
+                    if not neighbor_is_solid:
+                        continue
+
+                    C_loc = C[ix, iy, iz]
+                    dq = k_m3_per_mg_per_step * (qmax_mass_per_cell_mg - q[ix, iy, iz]) * C_loc
+                    dq = max(0.0, min(dq, qmax_mass_per_cell_mg - q[ix, iy, iz]))
+                    q[ix, iy, iz] += dq
+
+                    dC = dq / (cell_volume + 1e-30)
+                    C_new = max(C[ix, iy, iz] - dC, 0.0)
+                    C[ix, iy, iz] = C_new
+                    g[ix, iy, iz, :] = w * C_new
+
+        if total_media_mass > 0.0:
+            q_total_mg = np.sum(q)
+            q_hist[step] = q_total_mg / (total_media_mass * 1000.0)
+        else:
+            q_hist[step] = 0.0
+
+    return C, q, q_hist
+
+
+# -------------------------------------------------------
+# 6. Main sweep
+# -------------------------------------------------------
+
+def main():
+    centers, radii = load_packing("Packed_DEM_FINAL.txt")
+
+    calib = np.load("calibrated_parameters_subdomain.npz")
+    q_ref_calib = float(calib["q_ref"])
+    k_ref_calib = float(calib["k_ref"])
+    print("Using calibrated q_ref =", q_ref_calib, "mg/g; k_ref =", k_ref_calib, "L/mg/min")
+
+    solid, domain_min, dx, nx, ny, nz = voxelize_spheres_subdomain(
+        centers, radii,
+        nx=120, ny=100, nz=100,
+        n_per_d_min=20,
+    )
+    print("Voxelisation completed. Grid:", solid.shape, "dx:", dx)
+
+    nu_phys = 1.0e-6
+    D_phys = 1.0e-9
+    Lc = dx
+    rho_media = 2650.0
+
+    nu_lbm = 0.1
+    tau_f = 3.0 * nu_lbm + 0.5
+    D_lbm = 0.05
+    tau_c = 3.0 * D_lbm + 0.5
+
+    velocities = np.array([1.0e-4, 3.0e-4, 5.0e-4])
+    As_concs = np.array([50.0, 100.0, 200.0])
+    pH_vals = np.array([6.5, 7.0, 7.5])
+
+    nU = len(velocities)
+    nC = len(As_concs)
+    nP = len(pH_vals)
+
+    Re_vals = np.zeros((nU, nC, nP))
+    Pe_vals = np.zeros((nU, nC, nP))
+    Ma_vals = np.zeros((nU, nC, nP))
+    k_vals = np.zeros((nU, nC, nP))
+    qmax_vals = np.zeros((nU, nC, nP))
+
+    nsteps_flow = 1000
+    nsteps_scalar = 50
+
+    q_hist_all = np.zeros((nU, nC, nP, nsteps_scalar))
+    dqdt_hist_all = np.zeros((nU, nC, nP, nsteps_scalar))
+    Da_hist_all = np.zeros((nU, nC, nP, nsteps_scalar))
+
+    cs_lbm = np.sqrt(1.0 / 3.0)
+
+    for iu, U_phys in enumerate(velocities):
+        for ic, Cin_phys in enumerate(As_concs):
+            for ip, pH in enumerate(pH_vals):
+                print(f"Running case U={U_phys:.2e} m/s, C_in={Cin_phys:.1f} µg/L, pH={pH:.1f}")
+
+                U_lbm = U_phys / dx
+                Ma = abs(U_lbm) / cs_lbm
+                if Ma > 0.3:
+                    print(f"  Warning: Ma={Ma:.2f} > 0.3")
+
+                Re = U_phys * Lc / nu_phys
+                Pe = U_phys * Lc / D_phys
+
+                qmax_phys = get_qmax(pH, q_ref_calib)
+                k_phys = get_k(pH, Cin_phys, k_ref_calib)
+
+                Cin_mgL = Cin_phys / 1000.0
+                k_s = k_phys / 60.0
+                Da_char = (k_s * Cin_mgL * Lc) / (U_phys + 1e-20)
+
+                Re_vals[iu, ic, ip] = Re
+                Pe_vals[iu, ic, ip] = Pe
+                Ma_vals[iu, ic, ip] = Ma
+                k_vals[iu, ic, ip] = k_phys
+                qmax_vals[iu, ic, ip] = qmax_phys
+
+                print(f"  Re={Re:.3e}, Pe={Pe:.3e}, Ma={Ma:.3e}, Da_char={Da_char:.3e}")
+
+                u = lbm_flow(solid, nx, ny, nz, nsteps_flow, tau_f, U_lbm, u_clip=0.1)
+
+                C, q, q_hist = lbm_scalar_reactive(
+                    solid, u, nx, ny, nz, nsteps_scalar, tau_c,
+                    C_inlet=1.0, dx=dx,
+                    qmax_phys=qmax_phys, k_phys=k_phys, rho_media=rho_media,
+                )
+
+                q_hist_all[iu, ic, ip, :] = q_hist
+                dqdt_hist_all[iu, ic, ip, :] = np.gradient(q_hist)
+
+                q_max_mg_g = qmax_phys
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    Da_t = np.where(q_max_mg_g > 0.0, q_hist / q_max_mg_g * Da_char, 0.0)
+                Da_hist_all[iu, ic, ip, :] = Da_t
+
+    np.savez(
+        "lbm_rt_reactive_summary_q_Da.npz",
+        Re_vals=Re_vals,
+        Pe_vals=Pe_vals,
+        Ma_vals=Ma_vals,
+        k_vals=k_vals,
+        qmax_vals=qmax_vals,
+        velocities=velocities,
+        As_concs=As_concs,
+        pH_vals=pH_vals,
+        q_hist_all=q_hist_all,
+        dqdt_hist_all=dqdt_hist_all,
+        Da_hist_all=Da_hist_all,
+    )
+
+    print("Saved summary data to lbm_rt_reactive_summary_q_Da.npz")
+
+
+if __name__ == "__main__":
+    main()

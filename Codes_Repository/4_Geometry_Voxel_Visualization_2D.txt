@@ -1,0 +1,53 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+plt.rcParams.update({
+    "font.family": "serif",
+    "font.size": 10,
+    "figure.dpi": 300,
+    "savefig.dpi": 600,
+})
+
+# Load solid mask and velocity magnitude snapshot
+solid = np.load("solid_mask.npy")                 # shape: (nx, ny, nz)
+u_mag = np.load("u_mag_snapshot_step800.npy")     # shape: (nx, ny, nz)
+
+nx, ny, nz = solid.shape
+mid_y = ny // 2
+
+u_slice     = u_mag[:, mid_y, :]
+solid_slice = solid[:, mid_y, :]
+
+fig, ax = plt.subplots(figsize=(6, 4))
+
+# Velocity magnitude in pore space
+u_plot = np.ma.array(u_slice, mask=(solid_slice == 1))
+im = ax.imshow(
+    u_plot.T,
+    origin="lower",
+    cmap="viridis",
+    interpolation="bilinear",
+    aspect="equal",
+)
+
+# Solid phase overlay
+grain_mask = np.ma.masked_where(solid_slice == 0, solid_slice)
+ax.imshow(
+    grain_mask.T,
+    origin="lower",
+    cmap="gray",
+    interpolation="nearest",
+    aspect="equal",
+    alpha=1.0,
+)
+
+cbar = fig.colorbar(im, ax=ax, pad=0.02)
+cbar.set_label(r"Velocity magnitude $|u|$ (lattice units)")
+
+ax.set_xlabel("x index")
+ax.set_ylabel("z index")
+ax.set_title("Mid-plane velocity magnitude")
+
+plt.tight_layout()
+plt.savefig("2D_u_Midplane_continous.png")
+plt.show()

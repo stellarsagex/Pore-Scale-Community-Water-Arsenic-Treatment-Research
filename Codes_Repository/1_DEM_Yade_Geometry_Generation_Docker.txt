@@ -1,0 +1,145 @@
+# -*- coding: utf-8 -*-
+# YADE script: periodic DEM sphere packing in a 5 cm cube.
+
+from yade import pack, export
+import math
+import random
+
+# ------------- 1. Global parameters -------------
+
+# Domain size [m]
+L = 0.05  # 5 cm
+
+# Target initial porosity (DEM compaction will adjust)
+targetPorosity = 0.40
+
+# Grain size range [m] (diameter)
+d_min = 0.0003  # 0.30 mm
+d_max = 0.0020  # 2.00 mm
+
+# Material properties
+youngModulus   = 5e9
+poissonRatio   = 0.25
+density        = 2650
+frictionAngleDeg = 30.0
+
+# Isotropic compaction parameters
+sigmaIso      = -1e5
+maxUnbalanced = 0.1
+relStressTol  = 5e-3
+maxStrainRate = (5.0, 5.0, 5.0)
+
+# Random seed for reproducibility
+seed = 42
+random.seed(seed)
+
+# ------------- 2. Material -------------
+
+id_mat = O.materials.append(
+    FrictMat(
+        young=youngModulus,
+        poisson=poissonRatio,
+        density=density,
+        frictionAngle=math.radians(frictionAngleDeg),
+    )
+)
+
+# ------------- 3. Periodic sphere cloud -------------
+
+O.periodic = True
+mn = (0.0, 0.0, 0.0)
+mx = (L,   L,   L)
+
+sp = pack.SpherePack()
+
+# Radii range [m]
+r_min = 0.5 * d_min
+r_max = 0.5 * d_max
+r_mean = 0.5 * (r_min + r_max)
+r_rel_fuzz = (r_max - r_min) / (r_max + r_min)
+
+# Approximate number of grains from target porosity using r_mean
+avg_r = r_mean
+avg_grain_vol = (4.0 / 3.0) * math.pi * avg_r**3
+domain_vol = L**3
+approx_num_grains = int((1.0 - targetPorosity) * domain_vol / avg_grain_vol)
+approx_num_grains = min(approx_num_grains, 8000)
+
+print("Target diameters: %.3e–%.3e m (%.2f–%.2f mm)"
+      % (d_min, d_max, d_min*1e3, d_max*1e3))
+print("Target radii: %.3e–%.3e m (%.2f–%.2f mm)"
+      % (r_min, r_max, r_min*1e3, r_max*1e3))
+print("Estimated number of grains:", approx_num_grains)
+
+sp.makeCloud(
+    mn,
+    mx,
+    rMean=r_mean,
+    rRelFuzz=r_rel_fuzz,
+    num=approx_num_grains,
+    periodic=True,
+    seed=seed,
+)
+
+print("Actual number of spheres generated:", len(sp))
+
+sp.toSimulation(material=id_mat)
+
+# ------------- 4. Export hook -------------
+
+def exportPacking():
+    print("Compaction finished at iteration:", O.iter)
+
+    # Fix current periodic cell as reference
+    O.cell.trsf = Matrix3.Identity
+
+    from yade import utils
+    porosity = utils.porosity()
+    print("Final porosity:", porosity)
+
+    radii = [b.shape.radius for b in O.bodies if isinstance(b.shape, Sphere)]
+    if len(radii) > 0:
+        r_min_sim = min(radii)
+        r_max_sim = max(radii)
+        print("Sim radii: %.3e–%.3e m (%.2f–%.2f mm)"
+              % (r_min_sim, r_max_sim, r_min_sim*1e3, r_max_sim*1e3))
+
+    out_name = "Packed_DEM_FINAL.txt"
+    export.text(out_name)
+    print("Exported packing to", out_name)
+
+    O.pause()
+
+# ------------- 5. Engines -------------
+
+O.engines = [
+    ForceResetter(),
+    InsertionSortCollider([Bo1_Sphere_Aabb()]),
+    InteractionLoop(
+        [Ig2_Sphere_Sphere_ScGeom()],
+        [Ip2_FrictMat_FrictMat_FrictPhys()],
+        [Law2_ScGeom_FrictPhys_CundallStrack()],
+    ),
+    PeriTriaxController(
+        label="triax",
+        goal=(sigmaIso, sigmaIso, sigmaIso),
+        stressMask=7,
+        dynCell=True,
+        maxStrainRate=maxStrainRate,
+        relStressTol=relStressTol,
+        maxUnbalanced=maxUnbalanced,
+        doneHook='exportPacking()',
+    ),
+    NewtonIntegrator(damping=0.3),
+]
+
+O.dt = 0.5 * PWaveTimeStep()
+O.trackEnergy = True
+
+# ------------- 6. Run -------------
+
+print("Starting periodic DEM compaction...")
+O.run(100000000, True)
+print("Simulation complete.")
+
+
